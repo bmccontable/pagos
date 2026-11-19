@@ -1,0 +1,73 @@
+name: Firmar lista de pagos
+
+on:
+  push:
+    paths:
+      - pagos.csv
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firmar-pagos
+  cancel-in-progress: false
+
+jobs:
+  firmar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Firmar pagos.csv y escribir pagos.txt
+        env:
+          CLAVE_FIRMA: ${{ secrets.CLAVE_FIRMA }}
+        run: |
+          pip install --quiet cryptography
+          python3 - <<'PY'
+          import os, re, sys, base64, datetime
+          from cryptography.hazmat.primitives import hashes
+          from cryptography.hazmat.primitives.asymmetric import ec
+          from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+          clave = (os.environ.get("CLAVE_FIRMA") or "").strip().split("|")
+          if len(clave) != 4 or clave[0] != "BMCK1":
+              sys.exit("ERROR: el secreto CLAVE_FIRMA no existe o no empieza con BMCK1|")
+          d, x, y = (int.from_bytes(base64.b64decode(p), "big") for p in clave[1:])
+          priv = ec.derive_private_key(d, ec.SECP256R1())
+
+          items = {}
+          for n, linea in enumerate(open("pagos.csv", encoding="utf-8-sig").read().splitlines(), 1):
+              t = linea.strip()
+              if not t or t.startswith("#"):
+                  continue
+              partes = [p.strip() for p in t.split(",")]
+              pc = partes[0].upper()
+              if not re.fullmatch(r"PC-[A-Z0-9]{4}-[A-Z0-9]{4}", pc):
+                  sys.exit(f"ERROR en la línea {n}: el código de PC debe verse así PC-XXXX-XXXX -> {t}")
+              if len(partes) < 2 or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", partes[1]):
+                  sys.exit(f"ERROR en la línea {n}: falta la fecha con formato AAAA-MM-DD -> {t}")
+              try:
+                  f = datetime.date.fromisoformat(partes[1])
+              except ValueError:
+                  sys.exit(f"ERROR en la línea {n}: la fecha no existe -> {t}")
+              items[pc] = f.strftime("%Y%m%d")
+
+          lima = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-5)))
+          payload = "|".join(["P1", lima.strftime("%Y%m%d")] + [f"{k}={items[k]}" for k in sorted(items)]).encode()
+          r, s = decode_dss_signature(priv.sign(payload, ec.ECDSA(hashes.SHA256())))
+          firma = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+          b = lambda v: base64.urlsafe_b64encode(v).decode().rstrip("=")
+          open("pagos.txt", "w", newline="").write("BMCP1-" + b(payload) + "." + b(firma))
+          print(f"Lista firmada: {len(items)} cliente(s).")
+          PY
+      - name: Subir pagos.txt si cambió
+        run: |
+          git config user.name "bmc-firma"
+          git config user.email "bmc-firma@users.noreply.github.com"
+          git add pagos.txt
+          if git diff --cached --quiet; then
+            echo "Sin cambios."
+          else
+            git commit -m "pagos firmados"
+            git push
+          fi
